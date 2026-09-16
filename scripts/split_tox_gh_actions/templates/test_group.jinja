@@ -1,0 +1,105 @@
+  test-{{ lowercase_group }}:
+    name: {{ group }}
+    timeout-minutes: 30
+    runs-on: {% raw %}${{ matrix.os }}{% endraw %}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [{{ py_versions|join(",") }}]
+        # python3.6 reached EOL and is no longer being supported on
+        # new versions of hosted runners on Github Actions
+        # ubuntu-20.04 is the last version that supported python3.6
+        # see https://github.com/actions/setup-python/issues/544#issuecomment-1332535877
+        os: [ubuntu-22.04]
+
+    {% if needs_docker %}
+    services:
+      docker:
+        image: docker:dind  # Required for Docker network management
+        options: --privileged  # Required for Docker-in-Docker operations
+    {% endif %}
+    {% if needs_postgres %}
+    services:
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_PASSWORD: sentry
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        # Maps tcp port 5432 on service container to the host
+        ports:
+          - 5432:5432
+    env:
+      SENTRY_PYTHON_TEST_POSTGRES_HOST: {% raw %}${{ matrix.python-version == '3.6' && 'postgres' || 'localhost' }}{% endraw %}
+      SENTRY_PYTHON_TEST_POSTGRES_USER: postgres
+      SENTRY_PYTHON_TEST_POSTGRES_PASSWORD: sentry
+
+    {% endif %}
+    # Use Docker container only for Python 3.6
+    {% raw %}container: ${{ matrix.python-version == '3.6' && 'python:3.6' || null }}{% endraw %}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        {% raw %}if: ${{ matrix.python-version != '3.6' }}{% endraw %}
+        with:
+          python-version: {% raw %}${{ matrix.python-version }}{% endraw %}
+          allow-prereleases: true
+
+      {% if needs_clickhouse %}
+      - name: "Setup ClickHouse Server"
+        uses: getsentry/action-clickhouse-in-ci@5dc8a6a50d689bd6051db0241f34849e5a36490b # v1.7
+      {% endif %}
+
+      {% if needs_redis %}
+      - name: Start Redis
+        uses: supercharge/redis-github-action@87f27ff1ab2d9e62db54b11ee5e7f78ff18f8933 # v2
+      {% endif %}
+
+      {% if needs_java %}
+      - name: Install Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      {% endif %}
+
+      - name: Setup Test Env
+        run: |
+          pip install "coverage[toml]" tox
+      - name: Erase coverage
+        run: |
+          coverage erase
+
+      {% for framework in frameworks %}
+      - name: Test {{ framework }}
+        run: |
+          set -x # print commands that are executed
+          ./scripts/runtox.sh "{% raw %}py${{ matrix.python-version }}{% endraw %}-{{ framework }}"
+      {% endfor %}
+
+      - name: Generate coverage XML (Python 3.6)
+        if: {% raw %}${{ !cancelled() && matrix.python-version == '3.6' }}{% endraw %}
+        run: |
+          export COVERAGE_RCFILE=.coveragerc36
+          coverage combine .coverage-sentry-*
+          coverage xml --ignore-errors
+
+      - name: Generate coverage XML
+        if: {% raw %}${{ !cancelled() && matrix.python-version != '3.6' }}{% endraw %}
+        run: |
+          coverage combine .coverage-sentry-*
+          coverage xml
+
+      - name: Parse and Upload Coverage
+        if: {% raw %}${{ !cancelled() }}{% endraw %}
+        uses: getsentry/codecov-action@d90e69cdf071dfbb0430159125321dc09c424d4c # main
+        with:
+          token: {% raw %}${{ secrets.GITHUB_TOKEN }}{% endraw %}
+          files: coverage.xml
+          junit-xml-pattern: .junitxml
+          base-branch: master
+          verbose: true
