@@ -224,7 +224,10 @@ class HttpTransportCore(Transport):
         self.options: "Dict[str, Any]" = options
         self._worker = self._create_worker(options)
         self._auth = self.parsed_dsn.to_auth("sentry.python/%s" % VERSION)
-        self._disabled_until: "Dict[Optional[EventDataCategory], datetime]" = {}
+        # Rate limit budgets are tracked per target endpoint and data
+        # category so that a category throttled on one endpoint does not
+        # affect any other category or endpoint.
+        self._disabled_until: "Dict[Tuple[EndpointType, Optional[EventDataCategory]], datetime]" = {}
         # We only use this Retry() class for the `get_retry_after` method it exposes
         self._retry = urllib3.util.Retry()
         self._discarded_events: "DefaultDict[Tuple[EventDataCategory, str], int]" = (
@@ -325,14 +328,17 @@ class HttpTransportCore(Transport):
         return response.headers.get(header)
 
     def _update_rate_limits(
-        self: "Self", response: "Union[urllib3.BaseHTTPResponse, httpcore.Response]"
+        self: "Self",
+        response: "Union[urllib3.BaseHTTPResponse, httpcore.Response]",
+        endpoint_type: "EndpointType" = EndpointType.ENVELOPE,
     ) -> None:
         # new sentries with more rate limit insights.  We honor this header
         # no matter of the status code to update our internal rate limits.
         header = self._get_header_value(response, "x-sentry-rate-limits")
         if header:
             logger.warning("Rate-limited via x-sentry-rate-limits")
-            self._disabled_until.update(_parse_rate_limits(header))
+            for category, retry_after in _parse_rate_limits(header):
+                self._disabled_until[endpoint_type, category] = retry_after
 
         # old sentries only communicate global rate limit hits via the
         # retry-after header on 429.  This header can also be emitted on new
@@ -345,9 +351,9 @@ class HttpTransportCore(Transport):
                 if retry_after_value is not None
                 else None
             ) or 60
-            self._disabled_until[None] = datetime.now(timezone.utc) + timedelta(
-                seconds=retry_after
-            )
+            self._disabled_until[endpoint_type, None] = datetime.now(
+                timezone.utc
+            ) + timedelta(seconds=retry_after)
 
     def _handle_request_error(
         self: "Self",
@@ -369,8 +375,9 @@ class HttpTransportCore(Transport):
         self: "Self",
         response: "Union[urllib3.BaseHTTPResponse, httpcore.Response]",
         envelope: "Optional[Envelope]",
+        endpoint_type: "EndpointType" = EndpointType.ENVELOPE,
     ) -> None:
-        self._update_rate_limits(response)
+        self._update_rate_limits(response, endpoint_type)
 
         if response.status == 413:
             size_exceeded_message = (
@@ -451,16 +458,25 @@ class HttpTransportCore(Transport):
             type="client_report",
         )
 
-    def _check_disabled(self, category: str) -> bool:
+    def _check_disabled(
+        self: "Self",
+        category: "Optional[EventDataCategory]",
+        endpoint_type: "EndpointType" = EndpointType.ENVELOPE,
+    ) -> bool:
         def _disabled(bucket: "Any") -> bool:
-            ts = self._disabled_until.get(bucket)
+            ts = self._disabled_until.get((endpoint_type, bucket))
             return ts is not None and ts > datetime.now(timezone.utc)
 
         return _disabled(category) or _disabled(None)
 
-    def _is_rate_limited(self: "Self") -> bool:
+    def _is_rate_limited(
+        self: "Self", endpoint_type: "Optional[EndpointType]" = None
+    ) -> bool:
+        now = datetime.now(timezone.utc)
         return any(
-            ts > datetime.now(timezone.utc) for ts in self._disabled_until.values()
+            ts > now
+            for (endpoint, _), ts in self._disabled_until.items()
+            if endpoint_type is None or endpoint == endpoint_type
         )
 
     def _is_worker_full(self: "Self") -> bool:
@@ -469,22 +485,46 @@ class HttpTransportCore(Transport):
     def is_healthy(self: "Self") -> bool:
         return not (self._is_worker_full() or self._is_rate_limited())
 
-    def _prepare_envelope(
-        self: "Self", envelope: "Envelope"
-    ) -> "Optional[Tuple[Envelope, io.BytesIO, Dict[str, str]]]":
-        # remove all items from the envelope which are over quota
+    def _filter_rate_limited_items(
+        self: "Self", envelope: "Envelope", endpoint_type: "EndpointType"
+    ) -> "Envelope":
+        """
+        Remove all items from the envelope whose data category is currently
+        rate limited on the given endpoint, recording them as lost.
+
+        Items that may still be sent are kept, so that one throttled
+        category does not hold back the rest of the batch.  The dropped
+        items are accounted for in the pending client report.  If anything
+        was removed, a copy is returned so that others that hold references
+        do not see their envelope modified.
+        """
         new_items = []
         for item in envelope.items:
-            if self._check_disabled(item.data_category):
+            if self._check_disabled(item.data_category, endpoint_type):
                 if item.data_category in ("transaction", "error", "default", "statsd"):
                     self.on_dropped_event("self_rate_limits")
                 self.record_lost_event("ratelimit_backoff", item=item)
             else:
                 new_items.append(item)
 
+        if len(new_items) == len(envelope.items):
+            return envelope
+
+        return Envelope(headers=envelope.headers, items=new_items)
+
+    def _prepare_envelope(
+        self: "Self",
+        envelope: "Envelope",
+        endpoint_type: "EndpointType" = EndpointType.ENVELOPE,
+    ) -> "Optional[Tuple[Envelope, io.BytesIO, Dict[str, str]]]":
+        # Rate limits may have been updated after the envelope was queued,
+        # so remove all items which are over quota again right before
+        # sending.
+        envelope = self._filter_rate_limited_items(envelope, endpoint_type)
+
         # Since we're modifying the envelope here make a copy so that others
         # that hold references do not see their envelope modified.
-        envelope = Envelope(headers=envelope.headers, items=new_items)
+        envelope = Envelope(headers=envelope.headers, items=envelope.items)
 
         if not envelope.items:
             return None
@@ -678,7 +718,9 @@ class BaseHttpTransport(HttpTransportCore):
             self._handle_request_error(envelope=envelope, loss_reason="network")
             raise
         try:
-            self._handle_response(response=response, envelope=envelope)
+            self._handle_response(
+                response=response, envelope=envelope, endpoint_type=endpoint_type
+            )
         finally:
             response.close()
 
@@ -694,6 +736,14 @@ class BaseHttpTransport(HttpTransportCore):
         self,
         envelope: "Envelope",
     ) -> None:
+        # Drop rate limited items before they are queued so that a
+        # throttled data category cannot clog the queue that is shared
+        # with all other categories.  The drops are recorded for the
+        # client report, and the sendable items keep moving.
+        envelope = self._filter_rate_limited_items(envelope, EndpointType.ENVELOPE)
+        if not envelope.items:
+            return
+
         def send_envelope_wrapper() -> None:
             with capture_internal_exceptions():
                 self._send_envelope(envelope)
@@ -892,7 +942,9 @@ class AsyncHttpTransport(HttpTransportCore):
             self._handle_request_error(envelope=envelope, loss_reason="network")
             raise
         try:
-            self._handle_response(response=response, envelope=envelope)
+            self._handle_response(
+                response=response, envelope=envelope, endpoint_type=endpoint_type
+            )
         finally:
             await response.aclose()
 
@@ -930,6 +982,13 @@ class AsyncHttpTransport(HttpTransportCore):
     def capture_envelope(self: "Self", envelope: "Envelope") -> None:
         # Synchronous entry point
         if self.loop and self.loop.is_running():
+            # Drop rate limited items before they are queued so that a
+            # throttled data category cannot clog the queue that is shared
+            # with all other categories.  The drops are recorded for the
+            # client report, and the sendable items keep moving.
+            envelope = self._filter_rate_limited_items(envelope, EndpointType.ENVELOPE)
+            if not envelope.items:
+                return
             self.loop.call_soon_threadsafe(self._capture_envelope, envelope)
         else:
             # The event loop is no longer running
