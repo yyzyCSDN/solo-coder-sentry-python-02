@@ -38,6 +38,7 @@ from sentry_sdk import (
     isolation_scope,
 )
 from sentry_sdk._compat import PY37, PY38
+from sentry_sdk.consts import EndpointType
 from sentry_sdk.envelope import Envelope, Item, PayloadRef, parse_json
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration, ignore_logger
@@ -111,6 +112,17 @@ def mock_transaction_envelope(span_count: int) -> "Envelope":
     return envelope
 
 
+def _transaction_item():
+    return Item(
+        payload=PayloadRef(json={"type": "transaction", "spans": []}),
+        type="transaction",
+    )
+
+
+def _error_item():
+    return Item(payload=PayloadRef(json={"message": "boom"}), type="event")
+
+
 @pytest.mark.parametrize("debug", (True, False))
 @pytest.mark.parametrize("client_flush_method", ["close", "flush"])
 @pytest.mark.parametrize("use_pickle", (True, False))
@@ -171,11 +183,13 @@ def test_transport_works(
         (compression_level is None)
         or (
             # setting compression level to 0 means don't compress
-            compression_level > 0
+            compression_level
+            > 0
         )
     ) and (
         # if we couldn't resolve to a known algo, we don't compress
-        compression_algo != "<invalid>"
+        compression_algo
+        != "<invalid>"
     )
 
     assert capturing_server.captured[0].compressed == should_compress
@@ -458,13 +472,36 @@ def test_simple_rate_limits(capturing_server, make_client):
     assert capturing_server.captured[0].path == "/api/132/envelope/"
     capturing_server.clear_captured()
 
-    assert set(client.transport._disabled_until) == set([None])
+    assert set(client.transport._disabled_until) == set(
+        [(EndpointType.ENVELOPE.value, None)]
+    )
 
     client.capture_event({"type": "transaction"})
     client.capture_event({"type": "event"})
     client.flush()
 
-    assert not capturing_server.captured
+    # The over-quota data never goes out, but the client report accounting
+    # for the discarded items is still delivered even while globally limited.
+    assert len(capturing_server.captured) == 1
+    report_envelope = capturing_server.captured[0].envelope
+    assert [item.type for item in report_envelope.items] == ["client_report"]
+    report = parse_json(report_envelope.items[0].get_bytes())
+    discarded = report["discarded_events"]
+    assert {
+        "reason": "ratelimit_backoff",
+        "category": "transaction",
+        "quantity": 1,
+    } in discarded
+    assert {
+        "reason": "ratelimit_backoff",
+        "category": "span",
+        "quantity": 1,
+    } in discarded
+    assert {
+        "reason": "ratelimit_backoff",
+        "category": "error",
+        "quantity": 1,
+    } in discarded
 
 
 @pytest.mark.parametrize("response_code", [200, 429])
@@ -494,7 +531,9 @@ def test_data_category_limits(
     assert capturing_server.captured[0].path == "/api/132/envelope/"
     capturing_server.clear_captured()
 
-    assert set(client.transport._disabled_until) == set(["transaction"])
+    assert set(client.transport._disabled_until) == set(
+        [(EndpointType.ENVELOPE.value, "transaction")]
+    )
 
     client.capture_event({"type": "transaction"})
     client.capture_event({"type": "transaction"})
@@ -547,7 +586,12 @@ def test_data_category_limits_reporting(
     assert capturing_server.captured[0].path == "/api/132/envelope/"
     capturing_server.clear_captured()
 
-    assert set(client.transport._disabled_until) == set(["attachment", "transaction"])
+    assert set(client.transport._disabled_until) == set(
+        [
+            (EndpointType.ENVELOPE.value, "attachment"),
+            (EndpointType.ENVELOPE.value, "transaction"),
+        ]
+    )
 
     client.capture_event({"type": "transaction"})
     client.capture_event({"type": "transaction"})
@@ -641,14 +685,36 @@ def test_complex_limits_without_data_category(
     assert capturing_server.captured[0].path == "/api/132/envelope/"
     capturing_server.clear_captured()
 
-    assert set(client.transport._disabled_until) == set([None])
+    assert set(client.transport._disabled_until) == set(
+        [(EndpointType.ENVELOPE.value, None)]
+    )
 
     client.capture_event({"type": "transaction"})
     client.capture_event({"type": "transaction"})
     client.capture_event({"type": "event"})
     client.flush()
 
-    assert len(capturing_server.captured) == 0
+    # A global (no-category) limit blocks every data category, but the
+    # internal client report accounting for the discarded items still ships.
+    assert len(capturing_server.captured) == 1
+    report_envelope = capturing_server.captured[0].envelope
+    assert [item.type for item in report_envelope.items] == ["client_report"]
+    discarded = parse_json(report_envelope.items[0].get_bytes())["discarded_events"]
+    assert {
+        "reason": "ratelimit_backoff",
+        "category": "transaction",
+        "quantity": 2,
+    } in discarded
+    assert {
+        "reason": "ratelimit_backoff",
+        "category": "span",
+        "quantity": 2,
+    } in discarded
+    assert {
+        "reason": "ratelimit_backoff",
+        "category": "error",
+        "quantity": 1,
+    } in discarded
 
 
 @pytest.mark.parametrize("response_code", [200, 429])
@@ -773,7 +839,9 @@ def test_log_item_limits(capturing_server, response_code, item, make_client):
     assert capturing_server.captured[0].path == "/api/132/envelope/"
     capturing_server.clear_captured()
 
-    assert set(client.transport._disabled_until) == {"log_item"}
+    assert set(client.transport._disabled_until) == {
+        (EndpointType.ENVELOPE.value, "log_item")
+    }
 
     client.transport.capture_envelope(envelope)
     client.capture_event({"type": "transaction"})
@@ -920,9 +988,9 @@ async def test_transport_works_async(
         client = pickle.loads(pickle.dumps(client))
 
     # Verify we're using async transport
-    assert isinstance(client.transport, AsyncHttpTransport), (
-        "Expected AsyncHttpTransport"
-    )
+    assert isinstance(
+        client.transport, AsyncHttpTransport
+    ), "Expected AsyncHttpTransport"
 
     sentry_sdk.get_global_scope().set_client(client)
     request.addfinalizer(lambda: sentry_sdk.get_global_scope().set_client(None))
@@ -945,11 +1013,13 @@ async def test_transport_works_async(
         (compression_level is None)
         or (
             # setting compression level to 0 means don't compress
-            compression_level > 0
+            compression_level
+            > 0
         )
     ) and (
         # if we couldn't resolve to a known algo, we don't compress
-        compression_algo != "<invalid>"
+        compression_algo
+        != "<invalid>"
     )
 
     assert capturing_server.captured[0].compressed == should_compress
@@ -1041,3 +1111,153 @@ async def test_async_transport_rate_limiting_with_concurrency(
     # New request should be dropped due to rate limiting
     assert len(capturing_server.captured) == 0
     await client.close_async(timeout=2.0)
+
+
+@skip_under_gevent
+@pytest.mark.asyncio
+@pytest.mark.skipif(not PY38, reason="Async transport requires Python 3.8+")
+async def test_async_rate_limited_category_does_not_block_others(
+    capturing_server, make_client, request
+):
+    """A throttled category must not block sendable items on the async path."""
+    client = make_client(
+        send_client_reports=False,
+        _experiments={"transport_async": True},
+        integrations=[AsyncioIntegration()],
+    )
+    assert isinstance(client.transport, AsyncHttpTransport)
+    transport = client.transport
+    request.addfinalizer(lambda: sentry_sdk.get_global_scope().set_client(None))
+
+    transport._disabled_until = {
+        (EndpointType.ENVELOPE.value, "transaction"): datetime.now(timezone.utc)
+        + timedelta(seconds=60)
+    }
+
+    # Mixed batch: the throttled transaction is stripped while the error moves.
+    transport.capture_envelope(Envelope(items=[_transaction_item(), _error_item()]))
+    # A fully limited batch never reaches the wire.
+    transport.capture_envelope(Envelope(items=[_transaction_item()]))
+
+    await asyncio.sleep(0.2)
+
+    sent_categories = [
+        item.data_category
+        for captured in capturing_server.captured
+        for item in captured.envelope.items
+    ]
+    assert sent_categories == ["error"]
+
+    await client.close_async(timeout=2.0)
+
+
+def test_rate_limited_category_does_not_block_others(capturing_server, make_client):
+    """A throttled category must not squeeze the other categories in a batch."""
+    client = make_client(send_client_reports=False)
+    transport = client.transport
+
+    # Only the transaction category is limited on the envelope endpoint.
+    transport._disabled_until = {
+        (EndpointType.ENVELOPE.value, "transaction"): datetime.now(timezone.utc)
+        + timedelta(seconds=60)
+    }
+
+    envelope = Envelope(items=[_transaction_item(), _error_item()])
+    transport.capture_envelope(envelope)
+    client.flush()
+
+    # Exactly one envelope went out and it carries only the sendable error.
+    assert len(capturing_server.captured) == 1
+    sent_items = capturing_server.captured[0].envelope.items
+    assert [item.data_category for item in sent_items] == ["error"]
+
+    # The original envelope handed in by the caller must not be mutated.
+    assert [item.data_category for item in envelope.items] == [
+        "transaction",
+        "error",
+    ]
+
+
+def test_rate_limit_budget_is_scoped_per_endpoint(capturing_server, make_client):
+    """A limit on one endpoint/category does not affect another endpoint."""
+    client = make_client(send_client_reports=False)
+    transport = client.transport
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    # Limit transactions on the envelope endpoint only.
+    transport._disabled_until = {(EndpointType.ENVELOPE.value, "transaction"): future}
+
+    # Same category on a different endpoint is still sendable ...
+    assert transport._check_disabled("transaction", EndpointType.ENVELOPE) is True
+    assert transport._check_disabled("transaction", EndpointType.OTLP_TRACES) is False
+    # ... and a different category on the limited endpoint is unaffected.
+    assert transport._check_disabled("error", EndpointType.ENVELOPE) is False
+
+    # A global limit stays scoped to the endpoint that reported it.
+    transport._disabled_until = {(EndpointType.ENVELOPE.value, None): future}
+    assert transport._check_disabled("error", EndpointType.ENVELOPE) is True
+    assert transport._check_disabled("error", EndpointType.OTLP_TRACES) is False
+
+
+def test_single_limited_category_does_not_make_transport_unhealthy(
+    capturing_server, make_client
+):
+    """Backpressure must only trigger for a global limit, not one category."""
+    client = make_client()
+    transport = client.transport
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    transport._disabled_until = {(EndpointType.ENVELOPE.value, "transaction"): future}
+    # The worker is not full and the endpoint is not globally limited.
+    assert transport.is_healthy() is True
+
+    transport._disabled_until = {(EndpointType.ENVELOPE.value, None): future}
+    assert transport.is_healthy() is False
+
+
+def test_rate_limited_items_do_not_occupy_the_queue(capturing_server, make_client):
+    """Over-quota items are dropped up front so they cannot clog the queue."""
+    client = make_client(send_client_reports=False, transport_queue_size=1)
+    transport = client.transport
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    submitted = []
+    real_submit = transport._worker.submit
+
+    def tracking_submit(callback):
+        submitted.append(callback)
+        return real_submit(callback)
+
+    transport._worker.submit = tracking_submit
+    transport._disabled_until = {(EndpointType.ENVELOPE.value, "transaction"): future}
+
+    transport.capture_envelope(Envelope(items=[_transaction_item()]))
+
+    # Nothing sendable reached the shared queue at all.
+    assert submitted == []
+    assert len(capturing_server.captured) == 0
+
+
+def test_close_flushes_sendable_data_within_deadline(capturing_server, make_client):
+    """Shutdown must drain still-sendable data, skipping only throttled items."""
+    client = make_client(send_client_reports=True)
+    transport = client.transport
+    transport._disabled_until = {
+        (EndpointType.ENVELOPE.value, "transaction"): datetime.now(timezone.utc)
+        + timedelta(seconds=60)
+    }
+
+    transport.capture_envelope(Envelope(items=[_transaction_item(), _error_item()]))
+
+    # close() drains within the shutdown deadline and must still ship the error.
+    client.close(timeout=5.0)
+
+    categories = [
+        item.data_category
+        for captured in capturing_server.captured
+        for item in captured.envelope.items
+    ]
+    assert "error" in categories
+    assert "transaction" not in categories
+    # The dropped transaction is accounted for in a client report.
+    assert "internal" in categories
